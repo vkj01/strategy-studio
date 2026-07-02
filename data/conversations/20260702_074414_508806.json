@@ -1,0 +1,1 @@
+{"id": "20260702_074414_508806", "title": "Guardrail test", "ts": "2026-07-02T07:45:29", "messages": [{"role": "user", "content": "Sweep the stop-loss from 1% to 100% in 1% steps, and also sweep the target from 1000 to 50000."}, {"role": "user", "content": "Do it for me.."}]}

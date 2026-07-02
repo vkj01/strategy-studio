@@ -1,0 +1,12 @@
+# Keep data (DuckDBs) and conversations -- they carry the history we want on the demo.
+# Only ignore runtime junk + secrets.
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.env
+.env.*
+stockmock/generated_strategies/
+stockmock/generated/
+.streamlit/secrets.toml
+.DS_Store
