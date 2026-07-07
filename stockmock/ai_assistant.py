@@ -34,7 +34,8 @@ def _load_streamlit_secrets():
     environment so call_llm (which reads os.environ) works. Safe outside Streamlit."""
     try:
         import streamlit as st
-        for k in ("ANTHROPIC_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+        for k in ("ANTHROPIC_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
+                  "NEON_DATABASE_URL", "APP_PASSWORD"):
             if not os.environ.get(k) and k in st.secrets:
                 os.environ[k] = str(st.secrets[k])
     except Exception:
@@ -50,11 +51,12 @@ PROVIDERS = {
              "base_url": "https://api.groq.com/openai/v1",
              "cheap": "llama-3.1-8b-instant", "strong": "llama-3.3-70b-versatile"},
     "anthropic": {"key": "ANTHROPIC_API_KEY", "kind": "anthropic", "base_url": None,
-                  "cheap": "claude-haiku-4-5", "strong": "claude-opus-4-8"},
+                  "cheap": "claude-haiku-4-5", "mid": "claude-sonnet-5", "strong": "claude-opus-4-8"},
     "openai": {"key": "OPENAI_API_KEY", "kind": "openai", "base_url": None,
                "cheap": "gpt-4o-mini", "strong": "gpt-4o"},
 }
 PREFERENCE = {"cheap": ["groq", "anthropic", "openai"],
+              "mid": ["anthropic", "openai", "groq"],
               "strong": ["anthropic", "openai", "groq"]}
 
 
@@ -72,7 +74,35 @@ def llm_available():
 
 def active_label(tier="strong"):
     picked = _pick(tier)
-    return "%s (%s)" % (picked[0], picked[1][tier]) if picked else "offline"
+    if not picked:
+        return "offline"
+    model = picked[1].get(tier) or picked[1].get("strong")
+    return "%s (%s)" % (picked[0], model)
+
+
+# --- model routing: cheap Sonnet for everyday work, Opus for the heavy lifts ---
+# Escalate to Opus when the ask involves code, building/optimizing a strategy, or a
+# multi-run comparison / sweep (reasoning- and honesty-critical). Everything else --
+# single backtests, parameter tweaks, questions -- runs on Sonnet to control cost.
+_HEAVY_TRIGGERS = (
+    "optimize", "vectorize", "faster", "speed up", "build a", "build me", "write a strateg",
+    "create a strateg", "new strateg", "compare", "vs ", "versus", "best combination",
+    "best combo", "walk-forward", "walk forward", "sweep", "grid", "def signals", "```",
+)
+
+
+def _route_tier(history):
+    """Choose the model tier for an agentic turn: 'strong' (Opus) for heavy/complex/
+    code/compare asks, else 'mid' (Sonnet). Keeps everyday tests cheap."""
+    last = ""
+    for m in reversed(history or []):
+        if m.get("role") == "user":
+            last = str(m.get("content") or "")
+            break
+    low = last.lower()
+    if len(last) > 700 or any(k in low for k in _HEAVY_TRIGGERS):
+        return "strong"
+    return "mid"
 
 
 def call_llm(prompt, tier="strong", system=None, max_tokens=1200):
@@ -102,13 +132,43 @@ def call_llm(prompt, tier="strong", system=None, max_tokens=1200):
 # --- platform awareness ------------------------------------------------------
 def platform_context():
     lines = []
-    for label, inst in (("EQUITY", "equity"), ("OPTIONS", "options")):
+    for label, inst in (("EQUITY", "equity"), ("OPTIONS", "options"), ("FUTURES", "futures")):
         lines.append("%s strategies:" % label)
         for m in registry.list_meta(inst):
             vs = ", ".join(m["variables"].keys())
             lines.append("  - %s (key=%s): %s [variables: %s]"
                          % (m["name"], m["key"], m["description"], vs))
-    return "\n".join(lines)
+    return "\n".join(lines) + _data_coverage()
+
+
+def _data_coverage():
+    """How much history actually exists, per instrument -- so the AI never proposes
+    or runs a backtest outside the available dates. Cheap + rarely changes, so it
+    lives in the cached system block."""
+    def fmt(v):
+        s = str(int(v)); return "%s-%s-%s" % (s[:4], s[4:6], s[6:8])
+    lines = []
+    try:
+        import options_data as od
+        for sym in ("NIFTY", "BANKNIFTY", "MIDCPNIFTY"):
+            sp = od.data_span(sym)
+            if sp:
+                lines.append("  - %s options/futures: %s to %s (%d trading days)"
+                             % (sym, fmt(sp[0]), fmt(sp[1]), sp[2]))
+    except Exception:
+        pass
+    try:
+        import engine
+        s = engine.datastore.status()
+        lines.append("  - Equity daily: %s to %s (%s symbols)"
+                     % (s["from"], s["to"], s.get("symbols", "?")))
+    except Exception:
+        pass
+    if not lines:
+        return ""
+    return ("\n\nDATA COVERAGE -- only these date ranges exist. NEVER propose or run a "
+            "backtest outside them. If the user asks for an earlier/wider range, tell them "
+            "the real bounds and run within them:\n" + "\n".join(lines))
 
 
 SYSTEM = """You are the AI research analyst built into "Strategy Studio", a
@@ -116,11 +176,24 @@ stock & options strategy BACKTESTING platform. You help the user understand and
 use the platform: explain the available strategies and their variables, discuss
 trading ideas honestly, and help them decide what to test.
 
-Be concise, practical, and honest. You have three tools:
-  - run_backtest: run one backtest (preset strategy or custom options legs).
+Be concise, practical, and honest. You have four tools:
+  - run_backtest: run one backtest (preset strategy or custom options legs). Supports both
+    INTRADAY (default) and POSITIONAL/multi-day holds -- for a multi-day hold ("hold for the
+    month", "carry overnight", "positional straddle"), set params.positional=true and use the
+    positional exit params (max_hold_days / target_mtm / sl_mtm, expiry_type='monthly'). Never
+    run an intraday backtest to answer a question about holding across days -- use positional.
   - sweep_backtest: grid-search params to find the best combo (ranked).
   - build_strategy: write + run a NEW custom EQUITY strategy (signals(df,params)) when the
     presets don't cover the idea. np/pd only, no imports, vectorized, no infinite loops.
+  - optimize_code: when the user gives you strategy code to speed up. Two modes: (a) if the ask is
+    OPEN/exploratory ("how could this be improved?", "what can be optimized here?"), FIRST (plain
+    text, NO tool) say what the strategy does + list the concrete optimizations you'd make (what +
+    why) and ask which they want; (b) if it's a DIRECT command ("make it faster", "optimize this",
+    "do all"), just proceed. When proceeding, write the optimized signals(df,params) and CALL
+    optimize_code with BOTH the original and your version. It runs each, times signals(), and returns
+    a checksum of both -- same checksum = provably identical results. Report the REAL measured
+    speedup; if checksums differ, say the rewrite CHANGED the results (never claim equivalence) and
+    fix it. Also flag any issues with the STRATEGY itself (e.g. no exits, lookahead) honestly.
 
 *** ABSOLUTE RULE -- NEVER FABRICATE NUMBERS ***
 Every backtest metric you state (P&L, return, win rate, drawdown, CAGR, trades) MUST come from
@@ -143,6 +216,12 @@ genuinely unchanged from a run you already did this turn); never compare a fresh
 half-remembered one.
 After results, be a candid analyst -- flag weak win rates, large drawdowns, small samples,
 and overfitting risk rather than cheerleading.
+
+POSITIONAL CAVEAT: the intraday engine is validated to the rupee against StockMock; the
+POSITIONAL (multi-day) engine is NOT yet StockMock-validated. Whenever you report positional
+results, add a brief one-line caveat that positional numbers are preliminary / not yet
+cross-checked against StockMock. Also note that positional exits are checked once per day
+(one snapshot), so a stop can overshoot its Rs level vs an intraday tick-by-tick stop.
 
 APPLES-TO-APPLES + FULL DISCLOSURE (critical): Always STATE the full parameter set you
 actually used -- including any values carried over from earlier runs (capital, max_positions,
@@ -183,8 +262,14 @@ def _system_blocks():
         whole prompt at full price whenever a new run is logged).
     """
     return [
-        {"type": "text", "text": SYSTEM % platform_context(), "cache_control": {"type": "ephemeral"}},
-        {"type": "text", "text": "The user's recent backtest runs (most recent first):\n" + _history_context()},
+        # static instructions + strategy list: never changes -> cache for 1 HOUR so it
+        # stays warm across user pauses (not just 5 min). Written 2x, read at 0.1x.
+        {"type": "text", "text": SYSTEM % platform_context(),
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+        # recent run-history: its own 5-min cache breakpoint -> cache-read on turns that
+        # didn't log a new backtest (and on the 2nd call within a turn).
+        {"type": "text", "text": "The user's recent backtest runs (most recent first):\n" + _history_context(),
+         "cache_control": {"type": "ephemeral"}},
     ]
 
 
@@ -208,8 +293,11 @@ def chat(history):
 import json  # noqa: E402
 
 _OPT_KEYS = ("short_straddle", "short_strangle", "long_straddle", "long_strangle",
-             "iron_butterfly", "short_cp", "short_cp_sp", "short_atm_pct", "straddle_width")
+             "iron_butterfly", "short_cp", "short_cp_sp", "short_atm_pct", "straddle_width",
+             "expiry_day", "bear_call_spread", "bear_put_spread", "bull_call_spread",
+             "bull_put_spread", "iron_condor")
 _EQ_KEYS = ("ma_crossover", "rsi_reversion", "macd_crossover", "supertrend")
+_FUT_KEYS = ("long_futures", "short_futures")
 
 # --- GUARDRAILS (bound compute + LLM spend + runaway code) -------------------
 _SWEEP_CAP = 60        # max grid combinations per sweep call
@@ -227,7 +315,7 @@ RUN_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "instrument": {"type": "string", "enum": ["options", "equity"]},
+            "instrument": {"type": "string", "enum": ["options", "equity", "futures"]},
             "strategy": {"type": "string", "description":
                          "Registry key. options: " + ", ".join(_OPT_KEYS) + ". equity: "
                          + ", ".join(_EQ_KEYS) + ". Omit and give 'legs' for a custom options position."},
@@ -250,12 +338,27 @@ RUN_TOOL = {
                          "journey": {"type": "object"}},
                          "required": ["action", "type"]}},
             "params": {"type": "object", "description":
-                       "Engine params. OPTIONS: entry_time, exit_time (HH:MM), start, end (YYYY-MM-DD), "
-                       "lot_size (65), square_off ('one'|'all'), sl_mtm, target_mtm (Rs, whole strategy), "
-                       "move_sl_to_cost (bool), slippage_pct, cost_per_lot. "
+                       "Engine params. OPTIONS: symbol ('NIFTY'|'BANKNIFTY'|'MIDCPNIFTY'; BANKNIFTY is "
+                       "monthly-only, lot 35; NIFTY lot 65; MIDCPNIFTY lot 120), expiry_type "
+                       "('weekly'|'monthly'), entry_time, exit_time (HH:MM), start, end (YYYY-MM-DD), "
+                       "lot_size, square_off ('one'|'all'), sl_mtm, target_mtm (Rs, whole strategy), "
+                       "move_sl_to_cost (bool), slippage_pct, cost_per_lot, expiry_only/expiry_offset, "
+                       "use_futures_atm (bool). "
+                       "OPTIONS POSITIONAL (multi-day hold -- set positional=true): the position is "
+                       "entered ONCE and HELD across days, exiting on the first of target_mtm / sl_mtm "
+                       "(Rs, whole position) / max_hold_days (0 = hold till expiry) / expiry, checked "
+                       "once per day at check_time (default = exit_time). Use expiry_type='monthly' for "
+                       "typical positional holds. Do NOT set intraday-only params (square_off, journey, "
+                       "re_entry, trail, wait, expiry_only) with positional. "
                        "EQUITY: universe_size, fast_ma/slow_ma/ma_type (or rsi_period/oversold/exit_level, "
                        "macd_fast/macd_slow/macd_signal, atr_period/multiplier), stop_loss_pct, target_pct, "
-                       "trail_stop_pct, max_hold_days, capital, max_positions, cost_pct, start, end."}},
+                       "trail_stop_pct, max_hold_days, capital, max_positions, cost_pct, start, end.",
+                       "properties": {
+                           "positional": {"type": "boolean", "description":
+                                          "OPTIONS only: hold the position across multiple days instead of "
+                                          "squaring off intraday. See the positional notes above."},
+                           "max_hold_days": {"type": "integer"},
+                           "check_time": {"type": "string", "description": "HH:MM, positional daily mark time."}}}},
         "required": ["instrument"]}}
 
 SWEEP_TOOL = {
@@ -269,7 +372,7 @@ SWEEP_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "instrument": {"type": "string", "enum": ["options", "equity"]},
+            "instrument": {"type": "string", "enum": ["options", "equity", "futures"]},
             "strategy": {"type": "string", "description": "Registry key (or omit and give 'legs' for custom options)."},
             "legs": {"type": "array", "description": "Custom options legs (same shape as run_backtest).",
                      "items": {"type": "object"}},
@@ -322,6 +425,58 @@ def build_strategy_tool(args):
     return _result_summary(res), res, name, params
 
 
+OPTIMIZE_TOOL = {
+    "name": "optimize_code",
+    "description": (
+        "Speed up a user's EQUITY strategy code WITHOUT changing its results. The user gives you a "
+        "`signals(df, params)` function; you write a faster/cleaner `optimized_code` that computes the "
+        "EXACT same (entry, exit) signals (vectorize loops with numpy/pandas, remove redundant work). "
+        "This tool runs BOTH in the sandbox, times signals() only, and returns a checksum of each one's "
+        "signal arrays: same checksum = provably identical results. NEVER claim the versions are "
+        "equivalent unless the tool reports identical=true -- if the checksums differ your rewrite "
+        "changed behavior; fix it and re-run. Report the real speedup the tool measured, not a guess. "
+        "np and pd only, no imports, no infinite loops (killed after 60s)."),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "original_code": {"type": "string", "description": "The user's signals(df, params) code, verbatim."},
+            "optimized_code": {"type": "string", "description":
+                               "Your faster rewrite of signals(df, params) -- must yield the SAME signals."},
+            "name": {"type": "string", "description": "Short name for the strategy."},
+            "params": {"type": "object", "description":
+                       "Engine params to test on: universe_size, start, end, stop_loss_pct, etc. "
+                       "Both versions run with the SAME params so the comparison is apples-to-apples."}},
+        "required": ["original_code", "optimized_code"]}}
+
+
+def optimize_code_tool(args):
+    """Run the user's code and the AI's optimized rewrite, prove equivalence via a
+    signal checksum, and measure the real speedup. Returns (summary, res, label, params)."""
+    import strategy_sandbox as sb
+    orig = args.get("original_code") or ""
+    opt = args.get("optimized_code") or ""
+    name = args.get("name") or "strategy"
+    params = dict(args.get("params") or {})
+    reps = 6                                             # enough repeats for stable signals() timing
+    ro = sb.run_generated(orig, name + " (original)", params, timeout=60, repeats=reps)["result"]
+    rn = sb.run_generated(opt, name + " (optimized)", params, timeout=60, repeats=reps)["result"]
+    o_ms, n_ms = ro.get("signals_ms", 0.0), rn.get("signals_ms", 0.0)
+    identical = bool(ro.get("signals_checksum")) and ro["signals_checksum"] == rn["signals_checksum"]
+    speedup = round(o_ms / n_ms, 1) if n_ms > 0 else None
+    summary = {
+        "identical_results": identical,
+        "speedup_x": speedup,
+        "original": {"signals_ms": o_ms, "checksum": ro.get("signals_checksum"),
+                     "trades": ro["metrics"].get("n"),
+                     "total_return_pct": ro["performance"].get("total_return_pct")},
+        "optimized": {"signals_ms": n_ms, "checksum": rn.get("signals_checksum"),
+                      "trades": rn["metrics"].get("n"),
+                      "total_return_pct": rn["performance"].get("total_return_pct")},
+        "note": ("Same checksum -> the rewrite is provably equivalent." if identical
+                 else "CHECKSUMS DIFFER -> the rewrite CHANGED the results; do not claim equivalence.")}
+    return summary, rn, name + " (optimized)", params
+
+
 def _result_summary(res):
     """Compact numbers for the model to narrate (never the giant trade list)."""
     m, p, tr = res["metrics"], res["performance"], res["trades"]
@@ -369,15 +524,27 @@ def _preset_to_legs(key):
     return [{"action": a, "type": t, "mode": m, "value": v} for (a, t, m, v) in _PRESET_LEGS.get(key, [])]
 
 
+# Per-index F&O lot sizes (defaults the AI/user can override). A single default
+# silently mis-sized margins/P&L on BANKNIFTY & MIDCPNIFTY.
+_LOTS = {"NIFTY": 65, "BANKNIFTY": 35, "MIDCPNIFTY": 120}
+
+
+def _default_lot(symbol):
+    return _LOTS.get(str(symbol).upper(), 65)
+
+
 def _run_core(inst, strategy, legs, params):
     """Run one backtest. Returns (summary, res, name, key, log_params). No logging."""
     import options_engine
     import engine as eq_engine
     params = dict(params)
     if inst == "options":
-        params.setdefault("lot_size", 65)
+        # positional = hold the SAME contracts across days (multi-day), exit on
+        # total-MTM target/stop, max_hold_days, or expiry. Default is intraday.
+        positional = bool(params.pop("positional", False))
+        params.setdefault("lot_size", _default_lot(params.get("symbol", "NIFTY")))
         params.setdefault("entry_time", "09:20")
-        params.setdefault("exit_time", "15:15")
+        params.setdefault("exit_time", "15:15")             # also the positional check_time fallback
         params.setdefault("square_off", "one")
         if legs:                                    # custom position
             specs = [{"action": l.get("action", "sell"), "type": l.get("type", "CE"),
@@ -391,15 +558,24 @@ def _run_core(inst, strategy, legs, params):
                       "re_execute": int(l.get("re_execute", 0) or 0),
                       "journey": l.get("journey")} for l in legs]
             name, key = "Custom position", "custom"
-            res = options_engine.summarize_with(options_engine.custom_legs_fn(specs), name, params)
+            legs_fn = options_engine.custom_legs_fn(specs)
             log_params = {"legs": specs, **params}
+            if positional:
+                name += " (Positional)"
+                res = options_engine.summarize_positional(legs_fn, name, params)
+            else:
+                res = options_engine.summarize_with(legs_fn, name, params)
         else:
             key = strategy or "short_straddle"
             if key not in _OPT_KEYS:
                 raise ValueError("unknown options strategy '%s'" % key)
-            res = options_engine.summarize(key, params)
             name = registry.get(key)["meta"]["name"]
             log_params = params
+            if positional:
+                name += " (Positional)"
+                res = options_engine.summarize_positional(registry.get(key)["legs"], name, params)
+            else:
+                res = options_engine.summarize(key, params)
     elif inst == "equity":
         key = strategy or "ma_crossover"
         if key not in _EQ_KEYS:
@@ -407,8 +583,15 @@ def _run_core(inst, strategy, legs, params):
         res = eq_engine.summarize(key, params)
         name = registry.get(key)["meta"]["name"]
         log_params = params
+    elif inst == "futures":
+        key = strategy or "long_futures"
+        if key not in _FUT_KEYS:
+            raise ValueError("unknown futures strategy '%s'" % key)
+        res = options_engine.summarize(key, params)     # futures run through the leg engine
+        name = registry.get(key)["meta"]["name"]
+        log_params = params
     else:
-        raise ValueError("instrument must be 'options' or 'equity'")
+        raise ValueError("instrument must be 'options', 'equity' or 'futures'")
     return _result_summary(res), res, name, key, log_params
 
 
@@ -505,6 +688,7 @@ def sweep_backtest_tool(args, cap=_SWEEP_CAP):
 # --- cost meter (DEMO helper -- shows $/Rs per question; remove before demo) --
 # Per-1M-token USD rates. Cache write = 1.25x input, cache read = 0.1x input.
 _PRICES = {"claude-opus-4-8": (5.0, 25.0), "claude-opus-4-7": (5.0, 25.0),
+           "claude-sonnet-5": (3.0, 15.0),
            "claude-sonnet-4-6": (3.0, 15.0), "claude-haiku-4-5": (1.0, 5.0),
            "claude-fable-5": (10.0, 50.0)}
 _USD_INR = 83.0
@@ -531,15 +715,18 @@ def chat_agentic(history, max_rounds=4):
 
     import anthropic
     _, cfg = picked
+    tier = _route_tier(history)                         # Sonnet by default, Opus for heavy asks
+    model = cfg.get(tier) or cfg["strong"]
     client = anthropic.Anthropic(api_key=os.environ[cfg["key"]])
     system = _system_blocks()
     msgs = [{"role": m["role"], "content": m["content"]} for m in history[-20:]]
     results = []
     bt_used = [0]                       # GUARDRAIL: total engine backtests this turn
-    cost = {"usd": 0.0, "in_tokens": 0, "out_tokens": 0, "llm_calls": 0, "backtests": 0}
+    cost = {"usd": 0.0, "in_tokens": 0, "out_tokens": 0, "llm_calls": 0,
+            "backtests": 0, "model": model}
 
     def _meter(usage):
-        usd, ins, outs = _cost_from_usage(usage, cfg["strong"])
+        usd, ins, outs = _cost_from_usage(usage, model)
         cost["usd"] += usd; cost["in_tokens"] += ins; cost["out_tokens"] += outs
         cost["llm_calls"] += 1
 
@@ -563,12 +750,14 @@ def chat_agentic(history, max_rounds=4):
             return sweep_backtest_tool(inp)
         if name == "build_strategy":
             return build_strategy_tool(inp)
+        if name == "optimize_code":
+            return optimize_code_tool(inp)
         return run_backtest_tool(inp)
 
     try:
         for _ in range(max_rounds):
-            resp = client.messages.create(model=cfg["strong"], max_tokens=1600, system=system,
-                                          tools=[RUN_TOOL, SWEEP_TOOL, BUILD_TOOL], messages=msgs)
+            resp = client.messages.create(model=model, max_tokens=1600, system=system,
+                                          tools=[RUN_TOOL, SWEEP_TOOL, BUILD_TOOL, OPTIMIZE_TOOL], messages=msgs)
             _meter(resp.usage)
             if resp.stop_reason == "tool_use":
                 msgs.append({"role": "assistant", "content": resp.content})
@@ -611,15 +800,18 @@ def chat_agentic_stream(history, sink, max_rounds=4):
 
     import anthropic
     _, cfg = picked
+    tier = _route_tier(history)                         # Sonnet by default, Opus for heavy asks
+    model = cfg.get(tier) or cfg["strong"]
     client = anthropic.Anthropic(api_key=os.environ[cfg["key"]])
     system = _system_blocks()
     msgs = [{"role": m["role"], "content": m["content"]} for m in history[-20:]]
     results = []
     bt_used = [0]
-    cost = {"usd": 0.0, "in_tokens": 0, "out_tokens": 0, "llm_calls": 0, "backtests": 0}
+    cost = {"usd": 0.0, "in_tokens": 0, "out_tokens": 0, "llm_calls": 0,
+            "backtests": 0, "model": model}
 
     def _meter(usage):
-        usd, ins, outs = _cost_from_usage(usage, cfg["strong"])
+        usd, ins, outs = _cost_from_usage(usage, model)
         cost["usd"] += usd; cost["in_tokens"] += ins; cost["out_tokens"] += outs
         cost["llm_calls"] += 1
 
@@ -642,12 +834,14 @@ def chat_agentic_stream(history, sink, max_rounds=4):
             return sweep_backtest_tool(inp)
         if name == "build_strategy":
             return build_strategy_tool(inp)
+        if name == "optimize_code":
+            return optimize_code_tool(inp)
         return run_backtest_tool(inp)
 
     try:
         for _ in range(max_rounds):
-            with client.messages.stream(model=cfg["strong"], max_tokens=1600, system=system,
-                                        tools=[RUN_TOOL, SWEEP_TOOL, BUILD_TOOL], messages=msgs) as stream:
+            with client.messages.stream(model=model, max_tokens=1600, system=system,
+                                        tools=[RUN_TOOL, SWEEP_TOOL, BUILD_TOOL, OPTIMIZE_TOOL], messages=msgs) as stream:
                 for text in stream.text_stream:
                     yield text
                 final = stream.get_final_message()

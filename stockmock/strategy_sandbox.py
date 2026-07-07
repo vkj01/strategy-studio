@@ -20,11 +20,31 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from datetime import datetime
+
+try:
+    import resource                # POSIX only -- available on the Linux deploy target
+except ImportError:
+    resource = None                # Windows dev machine: memory cap becomes a no-op
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GEN_DIR = os.path.join(HERE, "generated_strategies")
 RUNNER = os.path.join(HERE, "strategy_runner.py")
+
+_MEM_LIMIT_BYTES = 1024 * 1024 * 1024      # 1 GB virtual memory per sandboxed run
+_MAX_OUTPUT_BYTES = 2 * 1024 * 1024        # 2 MB cap on captured stdout/stderr each
+
+
+def _limit_child_resources():
+    """preexec_fn (POSIX only): cap the child's virtual memory so a runaway
+    allocation (e.g. np.zeros(10**9)) gets killed instead of OOM-ing the whole
+    Streamlit process -- which would take down every user's session, not just
+    the one that submitted the bad code."""
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (_MEM_LIMIT_BYTES, _MEM_LIMIT_BYTES))
+    except Exception:
+        pass
 
 
 class SandboxError(Exception):
@@ -92,19 +112,60 @@ def save_generated(code, tag="strategy"):
     return path
 
 
-def run_generated(code, name, params, timeout=60):
+def run_generated(code, name, params, timeout=60, repeats=1):
     """Validate, save, and run the generated strategy in an isolated subprocess.
-    Returns {'result': <full res dict>, 'path': <saved file>}."""
+    `repeats` > 1 benchmarks signals() timing (for the code-optimizer). The result
+    dict carries signals_ms + signals_checksum. Returns {'result', 'path'}.
+
+    Bounded on three axes so a runaway AI-generated strategy can't take the whole
+    app down: wall-clock timeout, captured-output size (a huge print loop would
+    otherwise buffer unbounded in the parent before we ever get to truncate it),
+    and -- on the Linux deploy target -- virtual memory via RLIMIT_AS."""
     validate_code(code)                                   # fail fast, in-process
     path = save_generated(code, tag=name)
-    cmd = [sys.executable, RUNNER, path, name, json.dumps(params)]
+    cmd = [sys.executable, RUNNER, path, name, json.dumps(params), str(int(repeats))]
+    preexec = _limit_child_resources if resource is not None else None
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, cwd=HERE, preexec_fn=preexec)
+
+    outbuf, errbuf, killed = [], [], {"reason": None}
+
+    def _kill(reason):
+        if killed["reason"] is None:
+            killed["reason"] = reason
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _reader(stream, buf):
+        total = 0
+        for chunk in iter(lambda: stream.read(4096), ""):
+            buf.append(chunk)
+            total += len(chunk)
+            if total > _MAX_OUTPUT_BYTES:
+                buf.append("\n...[output truncated -- exceeded %d bytes]" % _MAX_OUTPUT_BYTES)
+                _kill("output")
+                break
+
+    t_out = threading.Thread(target=_reader, args=(proc.stdout, outbuf), daemon=True)
+    t_err = threading.Thread(target=_reader, args=(proc.stderr, errbuf), daemon=True)
+    t_out.start(); t_err.start()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=HERE)
+        proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
+        _kill("timeout")
+        proc.wait(timeout=5)
+    t_out.join(timeout=5); t_err.join(timeout=5)
+
+    out, err = "".join(outbuf), "".join(errbuf)
+    if killed["reason"] == "timeout":
         raise SandboxError("strategy timed out after %ds (possible infinite loop)" % timeout)
+    if killed["reason"] == "output":
+        raise SandboxError("strategy produced too much output (possible runaway loop) -- killed.")
     if proc.returncode != 0:
-        raise SandboxError("execution failed:\n%s" % (proc.stderr[-1500:] or "(no stderr)"))
-    for line in proc.stdout.splitlines():
+        raise SandboxError("execution failed:\n%s" % (err[-1500:] or "(no stderr)"))
+    for line in out.splitlines():
         if line.startswith("__RESULT__"):
             return {"result": json.loads(line[len("__RESULT__"):]), "path": path}
-    raise SandboxError("no result produced.\nstdout tail:\n%s" % proc.stdout[-800:])
+    raise SandboxError("no result produced.\nstdout tail:\n%s" % out[-800:])

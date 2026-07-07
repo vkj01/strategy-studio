@@ -1,67 +1,75 @@
-# Strategy Studio — Deploy to Streamlit Community Cloud
+# Strategy Studio — Deploy to Streamlit Community Cloud (multi-user beta)
 
-This folder is a **self-contained, deploy-ready** copy: the app (`stockmock/`), the
-data it needs (`data/*.duckdb` — options + equity), and your run + chat history.
-No raw tick data, no API keys committed.
+Self-contained, deploy-ready copy: the app (`stockmock/`) + the market data it needs
+(`data/options.duckdb` 97.5 MB, `data/market.duckdb` 8 MB). **No raw ticks, no API keys,
+no user data committed** — per-user backtests + AI chats now live in the **Neon** database.
 
-Live link result: `https://<your-app-name>.streamlit.app` — always on, password-gated.
+Live result: `https://<your-app>.streamlit.app` — always on, **account login**, per-user isolated.
+
+> This repo is already wired to **github.com/vkj01/strategy-studio**, which your existing
+> Streamlit Cloud app deploys from. So updating = push here → it auto-redeploys.
 
 ---
 
-## STEP 1 — Push this folder to a new GitHub repo
-
-Create a new **private** repo at https://github.com/new (e.g. `strategy-studio`), then
-in a terminal:
+## STEP 1 — Push the refreshed code + data
 
 ```bash
 cd "C:\Users\vises\OneDrive\Desktop\AI Backtester\deploy_package"
-git init
-git add .
-git commit -m "Strategy Studio - deploy"
-git branch -M main
-git remote add origin https://github.com/<YOUR_USERNAME>/strategy-studio.git
-git push -u origin main
+git push origin main
 ```
-(~37 MB push — fine. Data DuckDBs and conversations are included on purpose.)
+(~100 MB push the first time because `options.duckdb` grew to 97.5 MB — GitHub allows up
+to 100 MB per file, so we're just under. If it ever crosses 100 MB, switch to Git LFS or a
+boot-time download.)
 
-## STEP 2 — Create the app on Streamlit Community Cloud
+## STEP 2 — Set the Secrets on Streamlit Cloud
 
-1. Go to **https://share.streamlit.io** and sign in with GitHub.
-2. **Create app → Deploy a public app from GitHub**.
-3. Fill in:
-   - **Repository:** `<YOUR_USERNAME>/strategy-studio`
-   - **Branch:** `main`
-   - **Main file path:** `stockmock/app.py`
-4. Click **Advanced settings**:
-   - **Python version:** **3.11** (or 3.12) — matches what we tested; do NOT use 3.13
-     (the pinned numpy/pandas need <=3.12).
-   - **Secrets:** paste this (TOML), with YOUR values:
-     ```toml
-     ANTHROPIC_API_KEY = "sk-ant-...your-NEW-key..."
-     app_password = "pick-a-demo-password"
-     ```
-5. **Deploy.** First build takes ~3–6 min. You'll get the live link.
+In the app's **Settings → Secrets**, paste this TOML with YOUR values:
 
-## STEP 3 — Security (do these before sharing the link)
+```toml
+ANTHROPIC_API_KEY = "sk-ant-...your-NEW-key..."
+NEON_DATABASE_URL = "postgresql://neondb_owner:...@ep-...aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+```
 
-1. **Rotate the Claude key.** The old one was pasted in chat — generate a fresh key at
-   https://console.anthropic.com, and use the NEW key in the Secrets above.
-2. **Set a spending limit / alert** on the Anthropic account (Billing → Limits), so a
-   runaway can't cost much.
-3. **Keep `app_password` private** — share it only with your demo audience. The gate
-   stops anyone who finds the URL from using your Claude credits.
+- **`NEON_DATABASE_URL` is REQUIRED** for the multi-user beta. Without it the app drops to
+  single-user file mode and the test accounts below won't work.
+- **Do NOT set `SIGNUP_INVITE_CODE` and do NOT set `OPEN_SIGNUP`.** Signup then default-DENIES,
+  so nobody can self-register — only the pre-created test accounts (below) can log in. That's
+  what you want for a controlled beta. (To later allow self-signup: set `SIGNUP_INVITE_CODE`
+  to a code you share, or `OPEN_SIGNUP = "1"` for fully open.)
+- Python version (Advanced settings): **3.11 or 3.12** — NOT 3.13 (pinned numpy/pandas need <=3.12).
+- Main file path: **`stockmock/app.py`** · Branch: **`main`**.
+
+Streamlit Cloud auto-redeploys on push; secrets apply without a redeploy.
+
+## STEP 3 — Test accounts (already created in Neon)
+
+Hand these to your testers. They live in the Neon DB, so they work the moment Neon is wired:
+
+| Email | Password |
+|---|---|
+| tester1@studio.beta | Falcon-Test-91 |
+| tester2@studio.beta | Otter-Test-52 |
+| tester3@studio.beta | Raven-Test-38 |
+
+Each tester sees ONLY their own backtests + AI chats. Ask them to change nothing but explore:
+run backtests (equity / options / futures / **positional**), chat with the AI, download Excels.
+
+## STEP 4 — Security before sharing the link
+
+1. **Rotate the Anthropic key** — generate a fresh one at https://console.anthropic.com and use
+   it in Secrets (any key ever pasted in chat should be considered exposed).
+2. **Set an Anthropic spend limit / alert** (Billing → Limits) so a runaway can't cost much.
+3. The Neon URL carries the DB password — keep it ONLY in Streamlit Secrets, never in the repo.
+   You can rotate it any time from the Neon dashboard.
 
 ---
 
 ## Notes
 
-- **History:** the run history (`runs.duckdb`) and saved chats (`data/conversations/`)
-  ship with the repo, so the deployed app opens WITH your existing history. Anything
-  NEW created live during the demo persists only until the app restarts/redeploys
-  (Streamlit Cloud storage is ephemeral) — the shipped history always comes back.
-- **Changing password / key later:** edit them in the app's **Settings → Secrets** on
-  Streamlit Cloud (no redeploy needed).
-- **To update the app:** commit + push to the repo; Streamlit Cloud auto-redeploys.
-- **Strategy builder (AI writing new strategies):** runs a short-lived subprocess; works
-  on Streamlit Cloud. If a cloud sandbox ever blocks it, that one feature degrades
-  gracefully (returns an error) without affecting the rest.
+- **Per-user data** (backtests, AI chats) persists in Neon across redeploys. The app's local
+  disk is ephemeral on Streamlit Cloud, but nothing important is written there anymore.
+- **Positional (multi-day) backtests** are live but NOT yet StockMock-validated to the rupee —
+  the app/AI flags them as preliminary. Validate before trusting those numbers.
+- **To update the app later:** commit + push here; Streamlit Cloud auto-redeploys.
+- **AI strategy-builder** runs a short-lived sandboxed subprocess (memory + output capped); works
+  on Streamlit Cloud, degrades gracefully if a cloud sandbox ever blocks it.

@@ -1,5 +1,6 @@
-# Keep data (DuckDBs) and conversations -- they carry the history we want on the demo.
-# Only ignore runtime junk + secrets.
+# Ship the market-data DuckDBs (options + equity) -- the app needs them at runtime.
+# Do NOT ship per-user data (backtest runs + AI chats): those now live in the Neon
+# database, keyed per user. Only ignore runtime junk + secrets.
 __pycache__/
 *.pyc
 *.pyo
@@ -10,3 +11,7 @@ stockmock/generated_strategies/
 stockmock/generated/
 .streamlit/secrets.toml
 .DS_Store
+
+# per-user data now lives in Neon, not files
+data/conversations/
+data/runs.duckdb

@@ -9,11 +9,15 @@ import os
 
 from . import (ma_crossover, rsi_reversion, macd_crossover, supertrend,
                short_straddle, short_strangle, long_straddle, long_strangle,
-               iron_butterfly, short_cp, short_cp_sp, short_atm_pct, straddle_width)
+               iron_butterfly, short_cp, short_cp_sp, short_atm_pct, straddle_width,
+               expiry_day, bear_call_spread, bear_put_spread, bull_call_spread,
+               bull_put_spread, iron_condor, long_futures, short_futures)
 
 _MODULES = (ma_crossover, rsi_reversion, macd_crossover, supertrend,
             short_straddle, short_strangle, long_straddle, long_strangle,
-            iron_butterfly, short_cp, short_cp_sp, short_atm_pct, straddle_width)
+            iron_butterfly, short_cp, short_cp_sp, short_atm_pct, straddle_width,
+            expiry_day, bear_call_spread, bear_put_spread, bull_call_spread,
+            bull_put_spread, iron_condor, long_futures, short_futures)
 
 # equity strategies expose signals(); options strategies expose legs()
 STRATEGIES = {m.META["key"]: {"meta": m.META,

@@ -1,0 +1,17 @@
+# secrets -- never commit
+.env
+.env.*
+.streamlit/secrets.toml
+
+# user data (conversations, backtest history) + bulk market data -- provisioned
+# separately, not part of the repo (see DATA_PROVISIONING.md)
+data/
+generated_strategies/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store

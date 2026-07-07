@@ -51,32 +51,71 @@ def _summary_rows(res, params, name):
     return rows
 
 
-def _trades_df(res):
+def _day(d):
+    try:
+        return pd.Timestamp(str(d)).day_name()[:3]
+    except Exception:
+        return ""
+
+
+def _trades_df(res, name=""):
+    """Per-day (or per-trade) table, StockMock-style: Date, Day, Profit, running
+    Cumulative. Options add ATM/Expiry; futures don't (no strikes)."""
     trades = res["trades"]
+    is_fut = "future" in (name or "").lower()
     is_opt = bool(trades) and "pnl" in trades[0]
-    if is_opt:
-        rows = [{"Date": t["date"], "ATM": t.get("atm", ""), "Expiry": t.get("expiry", ""),
-                 "P&L (Rs)": int(round(t["pnl"])), "Return %": t.get("ret_pct", 0.0),
-                 "Outcome": t.get("outcome", "")} for t in trades]
-    else:
-        rows = [{"Symbol": t.get("symbol", ""), "Entry date": t.get("entry_date", ""),
-                 "Exit date": t.get("exit_date", ""), "Entry": t.get("entry", ""),
-                 "Exit": t.get("exit", ""), "Return %": t.get("ret_pct", 0.0),
-                 "Outcome": t.get("outcome", "")} for t in trades]
+    rows = []
+    cum = 0
+    if is_opt:                                           # options + futures (both P&L per day)
+        for t in trades:
+            pnl = int(round(t["pnl"])); cum += pnl
+            row = {"Date": t["date"], "Day": _day(t["date"])}
+            if not is_fut:
+                row["ATM"] = t.get("atm", ""); row["Expiry"] = t.get("expiry", "")
+            row["Profit (Rs)"] = pnl
+            row["Cumulative (Rs)"] = cum
+            row["Return %"] = t.get("ret_pct", 0.0)
+            row["Outcome"] = t.get("outcome", "")
+            rows.append(row)
+    else:                                                # equity: per-trade
+        for t in trades:
+            rows.append({"Symbol": t.get("symbol", ""), "Entry date": t.get("entry_date", ""),
+                         "Exit date": t.get("exit_date", ""), "Entry": t.get("entry", ""),
+                         "Exit": t.get("exit", ""), "Return %": t.get("ret_pct", 0.0),
+                         "Outcome": t.get("outcome", "")})
     return pd.DataFrame(rows)
 
 
 def build_excel(res, params, name):
-    """Return xlsx bytes: a Summary sheet + a per-day Trades sheet."""
+    """Return xlsx bytes: a Summary sheet + a per-day 'Result (By Date)' sheet,
+    laid out like StockMock's export (headers styled, columns sized, P&L coloured)."""
     buf = io.BytesIO()
+    tdf = _trades_df(res, name)
     with pd.ExcelWriter(buf, engine="xlsxwriter") as xl:
+        wb = xl.book
+        hdr = wb.add_format({"bold": True, "font_color": "white", "bg_color": "#2563EB",
+                             "border": 1, "align": "center"})
+        pos = wb.add_format({"font_color": "#16A34A"})
+        neg = wb.add_format({"font_color": "#DC2626"})
+
         sdf = pd.DataFrame(_summary_rows(res, params, name), columns=["Metric", "Value"])
         sdf.to_excel(xl, sheet_name="Summary", index=False)
-        _trades_df(res).to_excel(xl, sheet_name="Trades", index=False)
-        for sh, widths in (("Summary", [26, 22]), ("Trades", [14, 12, 12, 12, 10, 10, 10])):
-            ws = xl.sheets[sh]
-            for i, w in enumerate(widths):
-                ws.set_column(i, i, w)
+        ws = xl.sheets["Summary"]
+        ws.set_column(0, 0, 26); ws.set_column(1, 1, 22)
+        for c, t in enumerate(["Metric", "Value"]):
+            ws.write(0, c, t, hdr)
+
+        tdf.to_excel(xl, sheet_name="Result (By Date)", index=False)
+        ws2 = xl.sheets["Result (By Date)"]
+        for c, t in enumerate(tdf.columns):
+            ws2.write(0, c, t, hdr)
+            ws2.set_column(c, c, 13 if t in ("Cumulative (Rs)", "Entry date", "Exit date") else 11)
+        # colour the Profit column green/red
+        if "Profit (Rs)" in list(tdf.columns):
+            pc = list(tdf.columns).index("Profit (Rs)")
+            for r in range(len(tdf)):
+                v = tdf.iloc[r, pc]
+                ws2.write(r + 1, pc, v, pos if v >= 0 else neg)
     return buf.getvalue()
 
 
@@ -103,7 +142,7 @@ def build_pdf(res, params, name):
         ("FONTSIZE", (0, 0), (-1, -1), 9), ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f4f4fb")])]))
     story += [st_tbl, Spacer(1, 12), Paragraph("Per-day P&L", styles["Heading3"])]
 
-    df = _trades_df(res)
+    df = _trades_df(res, name)
     tdata = [list(df.columns)] + df.astype(str).values.tolist()
     t_tbl = Table(tdata, repeatRows=1)
     t_tbl.setStyle(TableStyle([

@@ -34,29 +34,37 @@ def _duck():
     return _DUCK
 
 
+# per-index strike step (ATM rounding). Extend as more indices are preprocessed.
+STEPS = {"NIFTY": 50, "BANKNIFTY": 100, "MIDCPNIFTY": 25}
+
+
+def index_step(symbol="NIFTY"):
+    return STEPS.get(str(symbol).upper(), 50)
+
+
 def _db_ready():
     global _USE_DB
     if _USE_DB is None:
         try:
-            _USE_DB = _duck().execute("SELECT COUNT(*) FROM nifty_options").fetchone()[0] > 0
+            _USE_DB = _duck().execute("SELECT COUNT(*) FROM options_1m").fetchone()[0] > 0
         except Exception:
             _USE_DB = False
     return _USE_DB
 
 
 @functools.lru_cache(maxsize=30000)
-def _series_db(date, expiry, strike, typ):
+def _series_db(date, expiry, strike, typ, symbol):
     return _duck().execute(
-        "SELECT time, open, high, low FROM nifty_options "
-        "WHERE date=? AND expiry=? AND strike=? AND type=? ORDER BY time",
-        [int(date), str(expiry), int(strike), typ]).fetchall()
+        "SELECT time, open, high, low FROM options_1m "
+        "WHERE symbol=? AND date=? AND expiry=? AND strike=? AND type=? ORDER BY time",
+        [str(symbol), int(date), str(expiry), int(strike), typ]).fetchall()
 
 
-@functools.lru_cache(maxsize=200)
-def _spot_series_db(date):
+@functools.lru_cache(maxsize=600)
+def _spot_series_db(date, symbol):
     return _duck().execute(
-        "SELECT time, price FROM nifty_spot WHERE date=? ORDER BY time",
-        [int(date)]).fetchall()
+        "SELECT time, price FROM spot_1m WHERE symbol=? AND date=? ORDER BY time",
+        [str(symbol), int(date)]).fetchall()
 
 
 def _from_rows(rows, hhmm):
@@ -110,18 +118,18 @@ def _price_at_zip(df, hhmm):
     return float(df["price"].iloc[-1])
 
 
-# --- public API (routes to DB, else zips) ------------------------------------
-def spot_at(date, hhmm):
+# --- public API (routes to DB, else zips). symbol defaults to NIFTY ----------
+def spot_at(date, hhmm, symbol="NIFTY"):
     if _db_ready():
-        return _from_rows(_spot_series_db(int(date)), hhmm)
-    return _price_at_zip(_read_csv(_idx_zip(date), "NIFTY.csv"), hhmm)
+        return _from_rows(_spot_series_db(int(date), symbol), hhmm)
+    return _price_at_zip(_read_csv(_idx_zip(date), "%s.csv" % symbol), hhmm)
 
 
-def spot_series(date):
-    """[(time, price)] 1-min NIFTY spot for the day (for range-breakout entry)."""
+def spot_series(date, symbol="NIFTY"):
+    """[(time, price)] 1-min index spot for the day (for range-breakout entry)."""
     if _db_ready():
-        return [(t, float(p)) for (t, p) in _spot_series_db(int(date))]
-    df = _read_csv(_idx_zip(date), "NIFTY.csv")
+        return [(t, float(p)) for (t, p) in _spot_series_db(int(date), symbol)]
+    df = _read_csv(_idx_zip(date), "%s.csv" % symbol)
     if df is None or df.empty:
         return []
     df = df.copy()
@@ -130,18 +138,18 @@ def spot_series(date):
     return [(hm, float(o[hm])) for hm in o.index]
 
 
-def option_price_at(date, expiry, strike, opt_type, hhmm):
+def option_price_at(date, expiry, strike, opt_type, hhmm, symbol="NIFTY"):
     if _db_ready():
-        return _from_rows(_series_db(int(date), str(expiry), int(strike), opt_type), hhmm)
-    csv = "NIFTY%s%d%s.csv" % (expiry, int(strike), opt_type)
+        return _from_rows(_series_db(int(date), str(expiry), int(strike), opt_type, symbol), hhmm)
+    csv = "%s%s%d%s.csv" % (symbol, expiry, int(strike), opt_type)
     return _price_at_zip(_read_csv(_opt_zip(date), csv), hhmm)
 
 
-def option_series(date, expiry, strike, opt_type):
+def option_series(date, expiry, strike, opt_type, symbol="NIFTY"):
     """[(time, open, high, low)] 1-min candles for one contract (for stop-loss)."""
     if _db_ready():
-        return _series_db(int(date), str(expiry), int(strike), opt_type)
-    df = _read_csv(_opt_zip(date), "NIFTY%s%d%s.csv" % (expiry, int(strike), opt_type))
+        return _series_db(int(date), str(expiry), int(strike), opt_type, symbol)
+    df = _read_csv(_opt_zip(date), "%s%s%d%s.csv" % (symbol, expiry, int(strike), opt_type))
     if df is None or df.empty:
         return []
     df = df.copy()
@@ -151,17 +159,46 @@ def option_series(date, expiry, strike, opt_type):
     return [(hm, float(o[hm]), float(h[hm]), float(l[hm])) for hm in o.index]
 
 
-def weekly_expiry(date):
-    """Current-week expiry for a date (as stored, e.g. '260609')."""
+@functools.lru_cache(maxsize=4000)
+def _expiries_db(date, symbol):
+    return [r[0] for r in _duck().execute(
+        "SELECT DISTINCT expiry FROM options_1m WHERE symbol=? AND date=? ORDER BY expiry",
+        [str(symbol), int(date)]).fetchall()]
+
+
+def weekly_expiry(date, symbol="NIFTY"):
+    """Nearest upcoming expiry for a date/symbol (as stored, e.g. '260609')."""
     if _db_ready():
-        r = _duck().execute("SELECT expiry FROM nifty_options WHERE date=? LIMIT 1",
-                            [int(date)]).fetchone()
-        return r[0] if r else None
+        exps = _expiries_db(int(date), symbol)
+        return exps[0] if exps else None
     d6 = int(str(date)[2:])
     for e in _zip_expiries(date):
         if e >= d6:
             return "%06d" % e
     return None
+
+
+def monthly_expiry(date, symbol="NIFTY"):
+    """Nearest upcoming MONTH-END expiry for a date/symbol (the monthly contract)."""
+    if _db_ready():
+        exps = [int(e) for e in _expiries_db(int(date), symbol)]
+        if not exps:
+            return None
+        month_end = {}                              # yymm -> last expiry that month
+        for e in exps:
+            ym = e // 100
+            month_end[ym] = max(month_end.get(ym, 0), e)
+        month_ends = sorted(set(month_end.values()))
+        for e in month_ends:
+            return "%06d" % e                       # smallest month-end present (>= day by construction)
+    return weekly_expiry(date, symbol)              # fallback
+
+
+def expiry_for(date, symbol="NIFTY", expiry_type="weekly"):
+    """Pick the weekly or monthly expiry for a day/symbol."""
+    if str(expiry_type).lower().startswith("month"):
+        return monthly_expiry(date, symbol)
+    return weekly_expiry(date, symbol)
 
 
 @functools.lru_cache(maxsize=64)
@@ -183,12 +220,54 @@ def atm_strike(spot, step=50):
     return int(round(spot / step) * step)
 
 
-def available_days():
+# --- futures (near-month continuous, from preprocess_futures.py) -------------
+@functools.lru_cache(maxsize=2000)
+def _fut_series_db(date, symbol):
+    try:
+        return _duck().execute(
+            "SELECT time, open, high, low FROM nifty_futures "
+            "WHERE date=? AND symbol=? ORDER BY time",
+            [int(date), str(symbol)]).fetchall()
+    except Exception:
+        return []
+
+
+def has_futures():
+    """True if the futures table is present and populated."""
+    try:
+        return _duck().execute("SELECT COUNT(*) FROM nifty_futures").fetchone()[0] > 0
+    except Exception:
+        return False
+
+
+def future_price_at(date, hhmm, symbol="NIFTY"):
+    """Near-month future price at HH:MM (first tick of the minute), or None."""
+    return _from_rows(_fut_series_db(int(date), symbol), hhmm)
+
+
+def future_series(date, symbol="NIFTY"):
+    """[(time, open, high, low)] 1-min futures candles for the day."""
+    return _fut_series_db(int(date), symbol)
+
+
+def available_days(symbol="NIFTY"):
     if _db_ready():
         return [int(r[0]) for r in _duck().execute(
-            "SELECT DISTINCT date FROM nifty_options ORDER BY date").fetchall()]
+            "SELECT DISTINCT date FROM options_1m WHERE symbol=? ORDER BY date",
+            [str(symbol)]).fetchall()]
     days = []
     for f in os.listdir(RAW) if os.path.isdir(RAW) else []:
         if f.startswith("NSE_OPT_TICK_") and f.endswith(".zip"):
             days.append(int(f[len("NSE_OPT_TICK_"):-4]))
     return sorted(days)
+
+
+@functools.lru_cache(maxsize=8)
+def data_span(symbol="NIFTY"):
+    """(first_date, last_date, n_days) as YYYYMMDD ints for a symbol, or None.
+    Used by the UI to show users how much history exists and to clamp the date
+    pickers so a wrong range can't be entered."""
+    days = available_days(symbol)
+    if not days:
+        return None
+    return days[0], days[-1], len(days)

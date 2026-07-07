@@ -23,22 +23,32 @@ def _dstr(d):
 
 
 def find_strike_by_premium(price_fn, atm, step, opt_type, target, max_steps=200):
-    """Scan OTM (CE up / PE down) for the strike whose premium is closest to
-    `target`. Premiums fall monotonically OTM, so we stop once we pass the
-    target. Returns the strike, or None if no data."""
-    direction = step if opt_type == "CE" else -step
-    best = None
-    best_diff = float("inf")
+    """Find the strike whose premium is closest to `target`, scanning either way.
+
+    Premium is monotonic in strike: for a CE it falls going OTM (strike up) and
+    rises going ITM (strike down); mirror for a PE. So we look at the ATM premium
+    and walk TOWARD the target -- OTM if the ATM premium is above the target,
+    ITM if it is below. Walking ITM is what lets Closest-Premium reach the
+    higher-premium in-the-money strikes on low-premium (near-expiry) days, which
+    is how StockMock behaves. Returns the strike, or None if no data at ATM."""
+    atm_px = price_fn(atm, opt_type)
+    if atm_px is None:
+        return None
+    otm = step if opt_type == "CE" else -step   # OTM direction lowers premium
+    direction = otm if atm_px > target else -otm
+    best, best_diff = atm, abs(atm_px - target)
     strike = atm
     for _ in range(max_steps):
-        px = price_fn(strike, opt_type)
-        if px is not None:
-            diff = abs(px - target)
-            if diff < best_diff:
-                best_diff, best = diff, strike
-            if px < target:                 # gone below target -> closest is here
-                break
         strike += direction
+        px = price_fn(strike, opt_type)
+        if px is None:                          # no data further out -> stop
+            break
+        diff = abs(px - target)
+        if diff < best_diff:
+            best_diff, best = diff, strike
+        # stop once the premium has crossed through the target
+        if (atm_px > target and px < target) or (atm_px <= target and px > target):
+            break
     return best
 
 
@@ -57,7 +67,7 @@ def _metrics(trades):
             "exp": round(float(r.mean()), 2), "avg_bars": 1.0}
 
 
-def _estimate_margin(legs, spot, lot_size):
+def _estimate_margin(legs, spot, lot_size, price_fn=None):
     """Rough SPAN+exposure margin for the position (NIFTY index options), used as
     the base for return/drawdown %. Hedge-aware:
       - a NAKED short leg needs ~11% of notional (spot*lot);
@@ -67,9 +77,27 @@ def _estimate_margin(legs, spot, lot_size):
       - a two-sided hedged book (iron fly/condor) is margined on its worst side.
     Long-only legs need just their debit (approximated at 3%). Calibrated to NIFTY
     2026 + StockMock's estimator -- an ESTIMATE, overridable via params['margin']."""
+    # Futures legs: SPAN+exposure ~ a fixed % of notional per NET lot (buy/sell
+    # offset -- a long+short calendar nets down). Add option legs' margin on top.
+    futs = [l for l in legs if l.get("type") == "FUT"]
+    if futs:
+        net = abs(sum((1 if l.get("action", "buy") == "buy" else -1) * int(l.get("lots", 1))
+                      for l in futs))
+        gross = sum(int(l.get("lots", 1)) for l in futs)
+        fut_margin = 0.12 * spot * lot_size * (net if net > 0 else gross)
+        opts = [l for l in legs if l.get("type") != "FUT"]
+        return round(fut_margin + (_estimate_margin(opts, spot, lot_size, price_fn) if opts else 0), 0)
     shorts = [l for l in legs if l.get("action", "sell") == "sell"]
     longs = [l for l in legs if l.get("action", "sell") == "buy"]
     if not shorts:
+        # Long-only: capital required = the premium DEBIT actually paid, which is
+        # how StockMock margins a bought position -- not a % of notional. Use the
+        # real entry premiums when available; fall back to a rough 3% otherwise.
+        if price_fn is not None:
+            debit = sum((price_fn(int(l["strike"]), l["type"]) or 0.0)
+                        * lot_size * int(l.get("lots", 1)) for l in legs)
+            if debit > 0:
+                return round(debit, 0)
         units = sum(int(l.get("lots", 1)) for l in legs)
         return round(0.03 * spot * lot_size * units, 0)
 
@@ -83,21 +111,35 @@ def _estimate_margin(legs, spot, lot_size):
         naked = 0.11 * spot * lot_size * units
         hedges = [l for l in longs if l["type"] == typ]
         if hedges:
-            # A CLOSE hedge is near defined-risk (width*lot); a FAR hedge gives little
-            # SPAN benefit -> approaches naked. Blend by how wide the hedge sits vs the
-            # scan range. (An estimate -- exact SPAN needs exchange files; margin editable.)
+            # A hedged short side (vertical spread) is margined at ~half the naked
+            # side's SPAN for typical spreads, rising toward the full naked value as
+            # the long wing widens and stops protecting. Calibrated to StockMock
+            # June-2026: bear call spreads 100/200/400-wide all ~Rs25k (~0.5x
+            # naked side * 0.77). (An estimate -- exact SPAN needs exchange files.)
             sk = s[0]["strike"]
             width = min(abs(int(l["strike"]) - int(sk)) for l in hedges)
-            defined = width * lot_size * units
-            f = min(width / scan, 1.0) if scan else 1.0
-            return defined * (1 - f) + naked * f
+            frac = 0.5 + 0.5 * max(0.0, min((width - 400) / (scan * 2.0), 1.0))
+            return naked * 0.77 * frac
         return naked                              # naked short
 
     m_ce, m_pe = side_margin("CE"), side_margin("PE")
-    if m_ce > 0 and m_pe > 0:                     # two-sided
+    if m_ce > 0 and m_pe > 0:                     # two-sided short book
         if not longs:
             return round((m_ce + m_pe) * 0.77, 0)   # naked straddle/strangle SPAN benefit
-        return round((m_ce + m_pe) * 0.85, 0)       # hedged both sides (iron fly/condor)
+        # Hedged both sides (iron fly / condor). StockMock does NOT collapse this to
+        # the tiny defined-risk width -- it margins at ~0.49x the NAKED straddle for
+        # typical (tight) wings, rising toward the naked value as the wings widen and
+        # stop protecting. Calibrated to SM June-2026: 100/200/300-wide fly all ~Rs49k
+        # (~0.49x naked ~Rs100k, flat under 300pt); CP~5 far hedge ~0.57x (~Rs1.5L).
+        def _naked(typ):
+            u = sum(int(l.get("lots", 1)) for l in shorts if l["type"] == typ)
+            return 0.11 * spot * lot_size * u
+        naked_straddle = (_naked("CE") + _naked("PE")) * 0.77
+        widths = [abs(int(l["strike"]) - int(s["strike"]))
+                  for s in shorts for l in longs if l["type"] == s["type"]]
+        width = min(widths) if widths else 0
+        frac = 0.49 + 0.51 * max(0.0, min((width - 300) / (scan * 1.1), 1.0))
+        return round(naked_straddle * frac, 0)
     return round(m_ce + m_pe, 0)
 
 
@@ -235,6 +277,7 @@ def _sim_day(date, expiry, legs, entry_t, exit_t, lot_size, params):
     peak = 0.0
     day_cap = None                                          # set to +/-threshold on a strategy stop/target/protect
     n = len(legs)
+    idx = str(params.get("symbol", "NIFTY")).upper()        # index for option/spot lookups
 
     # Range Breakout: build the spot range over [entry_t, entry_t+rb_minutes], then
     # each leg enters on its directional break -- PE when spot breaks ABOVE the high,
@@ -245,21 +288,31 @@ def _sim_day(date, expiry, legs, entry_t, exit_t, lot_size, params):
     rb_ready = ""
     spot_min = {}
     if rb:
-        sser = [(t, p) for (t, p) in od.spot_series(date) if entry_t <= t <= exit_t]
+        sser = [(t, p) for (t, p) in od.spot_series(date, idx) if entry_t <= t <= exit_t]
         spot_min = dict(sser)
         rb_ready = _hhmm_add(entry_t, int(params.get("rb_minutes", 8)))
         rng = [p for (t, p) in sser if t <= rb_ready]
         if rng:
             rb_hi, rb_lo = max(rng), min(rng)
 
+    def _ref_series(leg):
+        """Entry price + 1-min OHLC series for a leg -- a future (type 'FUT') is
+        priced from the near-month futures series; an option from its contract."""
+        if leg.get("type") == "FUT":
+            sym = leg.get("symbol", "NIFTY")
+            ref = od.future_price_at(date, entry_t, sym)
+            raw = od.future_series(date, sym)
+        else:
+            ref = od.option_price_at(date, expiry, leg["strike"], leg["type"], entry_t, idx)
+            raw = od.option_series(date, expiry, leg["strike"], leg["type"], idx)
+        return ref, raw
+
     st, series = [], []
     for leg in legs:
-        ref = od.option_price_at(date, expiry, leg["strike"], leg["type"], entry_t)
+        ref, raw = _ref_series(leg)
         if ref is None:
             return None
-        s = {t: (o, h, l) for (t, o, h, l) in
-             od.option_series(date, expiry, leg["strike"], leg["type"])
-             if entry_t <= t <= exit_t}
+        s = {t: (o, h, l) for (t, o, h, l) in raw if entry_t <= t <= exit_t}
         series.append(s)
         st.append({
             "leg": leg, "is_sell": leg["action"] == "sell",
@@ -322,8 +375,9 @@ def _sim_day(date, expiry, legs, entry_t, exit_t, lot_size, params):
             hi = lo = s["mark"] if v is None else None
             if v is not None:
                 _o, hi, lo = v
-            is_ce = s["leg"]["type"] == "CE"
-            p_up, p_dn = (hi, lo) if is_ce else (lo, hi)     # spot up vs down
+            # a future moves WITH spot, so it behaves like a CE for the up/down bound
+            up_side = s["leg"]["type"] in ("CE", "FUT")
+            p_up, p_dn = (hi, lo) if up_side else (lo, hi)   # spot up vs down
             q = s["lots"] * lot_size
             up += sign * (s["entry"] - p_up) * q
             down += sign * (s["entry"] - p_dn) * q
@@ -333,12 +387,13 @@ def _sim_day(date, expiry, legs, entry_t, exit_t, lot_size, params):
         """Journey: on the parent leg's SL, enter a configurable adjustment leg
         (action/type/ATM-offset/SL) resolved at the trigger minute."""
         j = st[parent_i]["journey"]
-        sp = od.spot_at(date, t)
+        sp = od.spot_at(date, t, idx)
         if sp is None:
             return
-        atm = od.atm_strike(sp)
-        strike = int(atm + round(float(j.get("value", 0)) / 50) * 50)
-        e = od.option_price_at(date, expiry, strike, j["type"], t)
+        stp = od.index_step(idx)
+        atm = od.atm_strike(sp, stp)
+        strike = int(atm + round(float(j.get("value", 0)) / stp) * stp)
+        e = od.option_price_at(date, expiry, strike, j["type"], t, idx)
         if e is None:
             return
         leg = {"type": j["type"], "action": j.get("action", "sell"), "strike": strike,
@@ -347,7 +402,7 @@ def _sim_day(date, expiry, legs, entry_t, exit_t, lot_size, params):
                "re_entry": 0, "re_execute": 0, "journey": None}
         legs.append(leg)
         series.append({tt: (o, h, l) for (tt, o, h, l) in
-                       od.option_series(date, expiry, strike, j["type"]) if t <= tt <= exit_t})
+                       od.option_series(date, expiry, strike, j["type"], idx) if t <= tt <= exit_t})
         sl = leg["sl_pct"] / 100.0
         st.append({
             "leg": leg, "is_sell": leg["action"] == "sell", "lots": leg["lots"], "ref": e,
@@ -480,7 +535,11 @@ def _sim_day(date, expiry, legs, entry_t, exit_t, lot_size, params):
 
     for i in range(len(st)):                                      # survivors exit at time
         if st[i]["started"] and st[i]["open"]:
-            px = od.option_price_at(date, expiry, legs[i]["strike"], legs[i]["type"], exit_t)
+            lg = legs[i]
+            if lg.get("type") == "FUT":
+                px = od.future_price_at(date, exit_t, lg.get("symbol", "NIFTY"))
+            else:
+                px = od.option_price_at(date, expiry, lg["strike"], lg["type"], exit_t, idx)
             close(i, px if px is not None else st[i]["mark"], exit_t, "time")
 
     res = [[st[i]["leg"], en, ex, tt, rn]
@@ -492,6 +551,11 @@ def _sim_day(date, expiry, legs, entry_t, exit_t, lot_size, params):
 
 def summarize(strategy_key, params):
     strat = registry.get(strategy_key)
+    # a strategy may pin engine-level flags (e.g. Expiry Day -> expiry_only); the
+    # user's params still win if they set the same key explicitly.
+    fixed = strat["meta"].get("fixed_params")
+    if fixed:
+        params = {**fixed, **params}
     return summarize_with(strat["legs"], strat["meta"]["name"], params)
 
 
@@ -504,8 +568,12 @@ def summarize_with(legs_fn, name, params):
     margin_est = None
     slip = float(params.get("slippage_pct", 0) or 0) / 100.0  # per fill side, % of premium
     cost_lot = float(params.get("cost_per_lot", 0) or 0)      # Rs round-trip per lot per leg-fill
+    symbol = str(params.get("symbol", "NIFTY")).upper()       # index: NIFTY / BANKNIFTY / MIDCPNIFTY
+    expiry_type = str(params.get("expiry_type", "weekly"))    # weekly | monthly
+    step = od.index_step(symbol)
 
-    days = od.available_days()
+    all_days = od.available_days(symbol)                    # full list (for expiry offsets)
+    days = list(all_days)
     if params.get("start"):
         s = int(str(params["start"]).replace("-", "")); days = [d for d in days if d >= s]
     if params.get("end"):
@@ -514,35 +582,60 @@ def summarize_with(legs_fn, name, params):
     if wd:
         wd = set(wd)
         days = [d for d in days if pd.Timestamp(_dstr(d)).weekday() in wd]
+    # Expiry-relative day filter: keep only days that sit `expiry_offset` TRADING days
+    # before their week's expiry (0 = the expiry day itself, DTE 0). Enabled by
+    # expiry_only or by passing expiry_offset. `d` is YYYYMMDD, weekly_expiry returns
+    # YYMMDD, so we map each expiry back to its full trading day for the position math.
+    if params.get("expiry_only") or params.get("expiry_offset") is not None:
+        eo = int(params.get("expiry_offset", 0) or 0)
+        posf = {d: i for i, d in enumerate(all_days)}
+        exp_full = {}                                       # YYMMDD expiry -> full YYYYMMDD day
+        for d in all_days:
+            exp_full[int(str(d)[2:])] = d
+        def _keep(d):
+            e = od.expiry_for(d, symbol, expiry_type)
+            if e is None:
+                return False
+            E = exp_full.get(int(e))
+            return E is not None and (posf[E] - posf[d]) == eo
+        days = [d for d in days if _keep(d)]
 
     trades = []
     for d in days:
-        expiry = od.weekly_expiry(d)
+        expiry = od.expiry_for(d, symbol, expiry_type)
         if expiry is None:
             continue
         # Strikes always resolve at entry_t (09:22). Range Breakout only delays each
         # leg's EXECUTION to its spot-break, handled per-leg inside _sim_day.
-        spot = od.spot_at(d, entry_t)
+        spot = od.spot_at(d, entry_t, symbol)
         if spot is None:
             continue
-        atm = od.atm_strike(spot)
+        # "Use Futures as ATM": resolve the ATM off the near-month future instead of
+        # spot (StockMock toggle). The future trades at a small premium to spot, so
+        # this can shift the ATM strike by a step on some days.
+        atm_ref = spot
+        if params.get("use_futures_atm"):
+            fp = od.future_price_at(d, entry_t, params.get("fut_symbol", symbol))
+            if fp is not None:
+                atm_ref = fp
+        atm = od.atm_strike(atm_ref, step)
 
-        def price_fn(strike, typ, D=d, E=expiry):
-            return od.option_price_at(D, E, strike, typ, entry_t)
+        def price_fn(strike, typ, D=d, E=expiry, S=symbol):
+            return od.option_price_at(D, E, strike, typ, entry_t, S)
 
         atm_ce = price_fn(atm, "CE") or 0.0
         atm_pe = price_fn(atm, "PE") or 0.0
-        ctx = {"atm": atm, "spot": spot, "step": 50,
+        ctx = {"atm": atm, "spot": spot, "step": step,
                "premium": price_fn,
                "straddle_premium": atm_ce + atm_pe,
-               "find_by_premium": (lambda typ, target, pf=price_fn, a=atm:
-                                   find_strike_by_premium(pf, a, 50, typ, target))}
+               "find_by_premium": (lambda typ, target, pf=price_fn, a=atm, st=step:
+                                   find_strike_by_premium(pf, a, st, typ, target))}
 
         legs = legs_fn(ctx, params)
         if not legs:
             continue
         if margin_est is None:
-            margin_est = _estimate_margin(legs, spot, lot_size)
+            margin_est = _estimate_margin(legs, spot, lot_size, price_fn)
         out = _sim_day(d, expiry, legs, entry_t, exit_t, lot_size, params)
         if not out:
             continue
@@ -562,10 +655,16 @@ def summarize_with(legs_fn, name, params):
                 pnl_pts += sign * (ee - xe) * leg.get("lots", 1)
             pnl = pnl_pts * lot_size - brokerage
         ds = _dstr(d)
-        trades.append({"symbol": "NIFTY", "date": ds, "entry_date": ds, "exit_date": ds,
+        trades.append({"symbol": symbol, "date": ds, "entry_date": ds, "exit_date": ds,
                        "atm": atm, "expiry": expiry, "pnl": round(pnl, 0),
                        "outcome": "win" if pnl > 0 else "loss"})
 
+    # On the expiry day SPAN margin roughly halves (positions expire same session,
+    # so far less overnight risk). StockMock reports this "On Expiry" margin, ~0.49x
+    # the normal estimate -- apply it for expiry-only strategies. (calibrated: naked
+    # straddle June 2026 = Rs48,498 on-expiry vs ~Rs98,622 normal.)
+    if params.get("expiry_only") and margin_est:
+        margin_est = round(margin_est * 0.49, 0)
     # base for all % = margin (StockMock convention): user override, else estimate.
     base = margin_override if margin_override > 0 else (margin_est or capital)
     for t in trades:
@@ -575,6 +674,164 @@ def summarize_with(legs_fn, name, params):
     out = [{"date": t["date"], "entry_date": t["entry_date"], "exit_date": t["exit_date"],
             "expiry": t["expiry"], "atm": t["atm"], "pnl": t["pnl"],
             "ret_pct": t["ret_pct"], "outcome": t["outcome"]}
+           for t in trades]
+    perf = _perf(trades, base)
+    perf["capital_base"] = round(base, 0)
+    perf["margin_est"] = round(margin_est or 0, 0)
+    return {"strategy": name, "metrics": _metrics(trades),
+            "performance": perf, "trades": out, "_trades_full": trades}
+
+
+# ============================================================================
+# POSITIONAL (multi-day) engine -- a SEPARATE path from the intraday one above.
+# Enter a leg-based position ONCE, hold the SAME contracts across trading days,
+# and exit when a rule fires (total-MTM target / stop, max hold days, or expiry).
+# Exits are checked on ONE snapshot per day (at check_time) -- cheap over long
+# holds, close to how positional traders actually monitor. Overnight risk means
+# NO same-day expiry margin discount (we use the full _estimate_margin). Positions
+# are sequential (non-overlapping): the next one opens the trading day after the
+# last exits, so a monthly hold naturally rolls to the next month. ASCII-only.
+# ============================================================================
+def _price_leg(date, expiry, leg, hhmm, symbol):
+    """Price one leg (option or FUT) at a given day+time, or None if no data."""
+    if leg.get("type") == "FUT":
+        return od.future_price_at(date, hhmm, leg.get("symbol", symbol))
+    return od.option_price_at(date, expiry, leg["strike"], leg["type"], hhmm, symbol)
+
+
+def summarize_positional(legs_fn, name, params):
+    """Multi-day hold of a leg-based position. See the section header above."""
+    lot_size = int(params.get("lot_size", 25))
+    entry_t = str(params.get("entry_time", "09:20"))
+    check_t = str(params.get("check_time", params.get("exit_time", "15:15")))
+    capital = float(params.get("capital", 100000))
+    margin_override = float(params.get("margin", 0) or 0)
+    slip = float(params.get("slippage_pct", 0) or 0) / 100.0
+    cost_lot = float(params.get("cost_per_lot", 0) or 0)
+    symbol = str(params.get("symbol", "NIFTY")).upper()
+    expiry_type = str(params.get("expiry_type", "monthly"))
+    step = od.index_step(symbol)
+    max_hold = int(params.get("max_hold_days", 0) or 0)     # 0 = hold till expiry
+    tgt_mtm = float(params.get("target_mtm", 0) or 0)        # Rs, whole position
+    sl_mtm = float(params.get("sl_mtm", 0) or 0)             # Rs, whole position
+
+    days = list(od.available_days(symbol))
+    if params.get("start"):
+        s = int(str(params["start"]).replace("-", "")); days = [d for d in days if d >= s]
+    if params.get("end"):
+        e = int(str(params["end"]).replace("-", "")); days = [d for d in days if d <= e]
+    N = len(days)
+
+    trades = []
+    margin_est = None
+    i = 0
+    while i < N:
+        d = days[i]
+        expiry = od.expiry_for(d, symbol, expiry_type)
+        if expiry is None:
+            i += 1; continue
+        # need at least one night: skip entry on the expiry day itself (0-day hold),
+        # roll to the next day (which picks the next expiry).
+        if int(str(d)[2:]) >= int(expiry):
+            i += 1; continue
+        spot = od.spot_at(d, entry_t, symbol)
+        if spot is None:
+            i += 1; continue
+        atm_ref = spot
+        if params.get("use_futures_atm"):
+            fp = od.future_price_at(d, entry_t, params.get("fut_symbol", symbol))
+            if fp is not None:
+                atm_ref = fp
+        atm = od.atm_strike(atm_ref, step)
+
+        def entry_price_fn(strike, typ, D=d, E=expiry, S=symbol):
+            return od.option_price_at(D, E, strike, typ, entry_t, S)
+
+        atm_ce = entry_price_fn(atm, "CE") or 0.0
+        atm_pe = entry_price_fn(atm, "PE") or 0.0
+        ctx = {"atm": atm, "spot": spot, "step": step, "premium": entry_price_fn,
+               "straddle_premium": atm_ce + atm_pe,
+               "find_by_premium": (lambda typ, target, pf=entry_price_fn, a=atm, stp=step:
+                                   find_strike_by_premium(pf, a, stp, typ, target))}
+        legs = legs_fn(ctx, params)
+        if not legs:
+            i += 1; continue
+
+        entries, ok = [], True
+        for leg in legs:
+            epx = _price_leg(d, expiry, leg, entry_t, symbol)
+            if epx is None:
+                ok = False; break
+            entries.append(epx)
+        if not ok:
+            i += 1; continue
+        if margin_est is None:                              # FULL overnight margin (no expiry discount)
+            margin_est = _estimate_margin(legs, spot, lot_size, entry_price_fn)
+
+        # hold forward, one snapshot per day at check_t, until an exit rule fires.
+        # We only ever price days at/before this contract's expiry; the "expiry"
+        # exit fires on the LAST trading day <= expiry (which need not equal the
+        # stored expiry date -- it may be a holiday), never on a post-expiry day.
+        last_px = list(entries)
+        exit_day, exit_px, reason, held = None, None, None, 0
+        j = i
+        while j < N:
+            cd = days[j]
+            if int(str(cd)[2:]) > int(expiry):              # safety: never price past expiry
+                break
+            cur = []
+            for k, leg in enumerate(legs):
+                px = _price_leg(cd, expiry, leg, check_t, symbol)
+                cur.append(px if px is not None else last_px[k])  # carry forward if a day is missing
+            last_px = cur
+            mtm = 0.0
+            for k, leg in enumerate(legs):
+                sign = 1.0 if leg.get("action", "sell") == "sell" else -1.0
+                mtm += sign * (entries[k] - cur[k]) * int(leg.get("lots", 1)) * lot_size
+            held = j - i                                    # 0 on entry day
+            next_rolls_past = (j + 1 < N) and (int(str(days[j + 1])[2:]) > int(expiry))
+            data_ends = (j + 1 >= N)
+            if tgt_mtm and mtm >= tgt_mtm:
+                reason = "target"
+            elif sl_mtm and mtm <= -sl_mtm:
+                reason = "stop"
+            elif max_hold and held >= max_hold:
+                reason = "max_days"
+            elif next_rolls_past:                           # last day at/before expiry
+                reason = "expiry"
+            elif data_ends:                                 # dataset ends mid-hold
+                reason = "data_end"
+            if reason:
+                exit_day, exit_px = cd, cur
+                break
+            j += 1
+        if exit_day is None:                                # shouldn't happen; safety net
+            exit_day, exit_px, reason = days[min(j, N - 1)], last_px, "data_end"
+
+        pnl_pts = 0.0
+        for k, leg in enumerate(legs):
+            is_sell = leg.get("action", "sell") == "sell"
+            ee = entries[k] * (1 - slip) if is_sell else entries[k] * (1 + slip)
+            xe = exit_px[k] * (1 + slip) if is_sell else exit_px[k] * (1 - slip)
+            sign = 1.0 if is_sell else -1.0
+            pnl_pts += sign * (ee - xe) * int(leg.get("lots", 1))
+        brokerage = cost_lot * sum(int(leg.get("lots", 1)) for leg in legs)
+        pnl = pnl_pts * lot_size - brokerage
+        ed, xd = _dstr(d), _dstr(exit_day)
+        trades.append({"symbol": symbol, "date": xd, "entry_date": ed, "exit_date": xd,
+                       "atm": atm, "expiry": expiry, "pnl": round(pnl, 0),
+                       "hold_days": held, "reason": reason,
+                       "outcome": "win" if pnl > 0 else "loss"})
+        # next position opens the trading day AFTER this one exits (sequential, no overlap)
+        i = days.index(exit_day) + 1
+
+    base = margin_override if margin_override > 0 else (margin_est or capital)
+    for t in trades:
+        t["ret"] = t["pnl"] / base if base else 0.0
+        t["ret_pct"] = round(100.0 * t["ret"], 3)
+    out = [{"date": t["date"], "entry_date": t["entry_date"], "exit_date": t["exit_date"],
+            "expiry": t["expiry"], "atm": t["atm"], "pnl": t["pnl"], "ret_pct": t["ret_pct"],
+            "hold_days": t["hold_days"], "reason": t["reason"], "outcome": t["outcome"]}
            for t in trades]
     perf = _perf(trades, base)
     perf["capital_base"] = round(base, 0)

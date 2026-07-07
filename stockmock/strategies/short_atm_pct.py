@@ -28,9 +28,13 @@ def legs(ctx, params):
     lots = int(params.get("lots", 1))
     pct = float(params.get("atm_pct", 1.0)) / 100.0
     step = ctx["step"]
-    spot = ctx["spot"]
-    ce = int(round(spot * (1 + pct) / step) * step)
-    pe = int(round(spot * (1 - pct) / step) * step)
+    # StockMock's ATM% mode measures the offset off the ATM STRIKE (the rounded
+    # ATM), not raw spot -- so the distance is 1% of a clean strike level. Basing
+    # it on raw spot shifts the pick one step nearer the money on days where spot
+    # sits far from the round strike. Validated 21/21 vs StockMock (June 2026).
+    atm = ctx["atm"]
+    ce = int(round(atm * (1 + pct) / step) * step)
+    pe = int(round(atm * (1 - pct) / step) * step)
     return [
         {"type": "CE", "action": "sell", "strike": ce, "lots": lots},
         {"type": "PE", "action": "sell", "strike": pe, "lots": lots},
